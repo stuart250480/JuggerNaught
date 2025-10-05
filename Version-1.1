@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""
+Designed by Stuart Burns
+
+Network Device Scanner
+Scans the local network for connected devices and displays their information.
+Includes port scanning to identify open ports on discovered devices.
+"""
+
+import socket
+import subprocess
+import platform
+import re
+import time
+from datetime import timedelta
+from ipaddress import IPv4Network
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Common ports to scan
+COMMON_PORTS = {
+    21: 'FTP',
+    22: 'SSH',
+    23: 'Telnet',
+    25: 'SMTP',
+    53: 'DNS',
+    80: 'HTTP',
+    110: 'POP3',
+    143: 'IMAP',
+    443: 'HTTPS',
+    445: 'SMB',
+    3306: 'MySQL',
+    3389: 'RDP',
+    5432: 'PostgreSQL',
+    5900: 'VNC',
+    8080: 'HTTP-Alt',
+    8443: 'HTTPS-Alt'
+}
+
+# Well-known services by port for UDP
+UDP_COMMON_PORTS = {
+    53: 'DNS',
+    67: 'DHCP Server',
+    68: 'DHCP Client',
+    69: 'TFTP',
+    123: 'NTP',
+    137: 'NetBIOS Name',
+    138: 'NetBIOS Datagram',
+    161: 'SNMP',
+    162: 'SNMP Trap',
+    500: 'IKE/IPSec',
+    514: 'Syslog',
+    1194: 'OpenVPN',
+    1701: 'L2TP',
+    4500: 'IPSec NAT-T',
+    5060: 'SIP'
+}
+
+
+def get_local_ip():
+    """Get the local IP address of this machine."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        return local_ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def get_network_range(ip):
+    """Calculate network range based on local IP (assumes /24 subnet)."""
+    parts = ip.split('.')
+    network = f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+    return network
+
+
+def ping_host(ip):
+    """Ping a single host to check if it's alive."""
+    param = '-n' if platform.system().lower() == 'windows' else '-c'
+    timeout = '-w' if platform.system().lower() == 'windows' else '-W'
+
+    command = ['ping', param, '1', timeout, '1', ip]
+
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=2
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, Exception):
+        return False
+
+
+def get_mac_address(ip):
+    """Get MAC address for an IP using ARP."""
+    try:
+        if platform.system().lower() == 'windows':
+            output = subprocess.check_output(['arp', '-a', ip], timeout=2).decode()
+            mac_search = re.search(r'([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})', output)
+        else:
+            output = subprocess.check_output(['arp', '-n', ip], timeout=2).decode()
+            mac_search = re.search(r'([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})', output)
+
+        if mac_search:
+            return mac_search.group(0)
+    except Exception:
+        pass
+    return "Unknown"
+
+
+def get_hostname(ip):
+    """Try to resolve hostname from IP."""
+    try:
+        hostname = socket.gethostbyaddr(ip)[0]
+        return hostname
+    except Exception:
+        return "Unknown"
+
+
+def grab_banner(ip, port, timeout=2):
+    """Attempt to grab banner information from an open port."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((ip, port))
+
+        # Try to receive banner (some services send it immediately)
+        try:
+            banner = sock.recv(1024).decode('utf-8', errors='ignore').strip()
+            if banner:
+                sock.close()
+                return banner
+        except socket.timeout:
+            pass
+
+        # For HTTP/HTTPS, send a basic request
+        if port in [80, 8080, 443, 8443]:
+            try:
+                request = b"HEAD / HTTP/1.1\r\nHost: " + ip.encode() + b"\r\n\r\n"
+                sock.send(request)
+                banner = sock.recv(1024).decode('utf-8', errors='ignore').strip()
+                if banner:
+                    # Extract server header if present
+                    for line in banner.split('\n'):
+                        if line.lower().startswith('server:'):
+                            sock.close()
+                            return line.split(':', 1)[1].strip()
+                    sock.close()
+                    return banner.split('\n')[0]  # Return first line (HTTP status)
+            except:
+                pass
+
+        # For SSH, FTP, SMTP, etc., send appropriate commands
+        if port == 22:  # SSH
+            banner = sock.recv(1024).decode('utf-8', errors='ignore').strip()
+        elif port == 21:  # FTP
+            banner = sock.recv(1024).decode('utf-8', errors='ignore').strip()
+        elif port == 25:  # SMTP
+            banner = sock.recv(1024).decode('utf-8', errors='ignore').strip()
+        elif port == 3306:  # MySQL
+            banner = sock.recv(1024).decode('utf-8', errors='ignore').strip()
+
+        sock.close()
+        return banner if banner else None
+
+    except Exception:
+        return None
+
+
+def scan_port(ip, port, timeout=0.5):
+    """Check if a specific port is open on the target IP."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((ip, port))
+        sock.close()
+        return result == 0
+    except Exception:
+        return False
+
+
+def scan_port(ip, port, timeout=0.5):
+    """Check if a specific TCP port is open on the target IP."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((ip, port))
+        sock.close()
+        return result == 0
+    except Exception:
+        return False
+
+
+def scan_udp_port(ip, port, timeout=1):
+    """Check if a specific UDP port is open/responding on the target IP."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+
+        # Send empty packet or service-specific packet
+        if port == 53:  # DNS
+            # Send a DNS query for version.bind
+            query = b'\x00\x00\x10\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+            sock.sendto(query, (ip, port))
+        elif port == 123:  # NTP
+            # Send NTP request
+            ntp_packet = b'\x1b' + 47 * b'\0'
+            sock.sendto(ntp_packet, (ip, port))
+        elif port == 161:  # SNMP
+            # Send SNMP get request
+            snmp_packet = b'\x30\x26\x02\x01\x00\x04\x06\x70\x75\x62\x6c\x69\x63'
+            sock.sendto(snmp_packet, (ip, port))
+        else:
+            # Generic UDP probe
+            sock.sendto(b'\x00', (ip, port))
+
+        try:
+            data, addr = sock.recvfrom(1024)
+            sock.close()
+            return True  # Port is open and responding
+        except socket.timeout:
+            sock.close()
+            return False  # No response (might be filtered or closed)
+
+    except Exception:
+        return False
+
+
+def scan_ports(ip, ports=None, timeout=0.5, grab_banners=True, scan_type='common', protocol='tcp'):
+    """Scan multiple ports on a single IP."""
+    if scan_type == 'full':
+        if protocol == 'tcp':
+            ports = range(1, 65536)
+        else:  # UDP
+            ports = range(1, 65536)
+    elif ports is None:
+        if protocol == 'tcp':
+            ports = COMMON_PORTS.keys()
+        else:  # UDP
+            ports = UDP_COMMON_PORTS.keys()
+
+    open_ports = []
+
+    for port in ports:
+        is_open = False
+
+        if protocol == 'tcp':
+            is_open = scan_port(ip, port, timeout)
+            service = COMMON_PORTS.get(port, f'TCP/{port}')
+        else:  # UDP
+            is_open = scan_udp_port(ip, port, timeout * 2)  # UDP needs more time
+            service = UDP_COMMON_PORTS.get(port, f'UDP/{port}')
+
+        if is_open:
+            port_info = {'port': port, 'service': service, 'banner': None, 'protocol': protocol.upper()}
+
+            # Only grab banners for TCP ports
+            if grab_banners and protocol == 'tcp':
+                banner = grab_banner(ip, port)
+                if banner:
+                    port_info['banner'] = banner[:200] if len(banner) > 200 else banner
+
+            open_ports.append(port_info)
+
+    return open_ports
+
+
+def scan_ip(ip, scan_ports_flag=False, scan_type='common', scan_udp=False):
+    """Scan a single IP address."""
+    if ping_host(ip):
+        mac = get_mac_address(ip)
+        hostname = get_hostname(ip)
+
+        device = {
+            'ip': ip,
+            'mac': mac,
+            'hostname': hostname,
+            'status': 'Online',
+            'open_ports': []
+        }
+
+        if scan_ports_flag:
+            # Scan TCP ports
+            device['open_ports'].extend(scan_ports(ip, scan_type=scan_type, protocol='tcp'))
+
+            # Scan UDP ports if requested
+            if scan_udp:
+                device['open_ports'].extend(scan_ports(ip, scan_type=scan_type, protocol='udp'))
+
+        return device
+    return None
+
+
+def scan_network(network_range, scan_ports_flag=False, scan_type='common', scan_udp=False, max_workers=50):
+    """Scan all IPs in the network range."""
+    start_time = time.time()
+
+    print(f"Scanning network: {network_range}")
+    if scan_ports_flag:
+        scan_mode = "Full port scan (1-65535)" if scan_type == 'full' else "Common ports"
+        protocols = "TCP + UDP" if scan_udp else "TCP only"
+        print(f"Port scanning enabled - {scan_mode} - {protocols}")
+        if scan_type == 'full':
+            print("WARNING: Full port scan will take significantly longer!")
+    else:
+        print("Port scanning disabled (use -p flag to enable)")
+
+    print(f"Scan started at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print("This may take a while...\n")
+
+    devices = []
+    network = IPv4Network(network_range)
+    total_hosts = sum(1 for _ in network.hosts())
+    completed = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(scan_ip, str(ip), scan_ports_flag, scan_type, scan_udp): ip for ip in
+                   network.hosts()}
+
+        for future in as_completed(futures):
+            completed += 1
+            elapsed = time.time() - start_time
+            progress = (completed / total_hosts) * 100
+
+            result = future.result()
+            if result:
+                devices.append(result)
+                ports_info = f" - {len(result['open_ports'])} open port(s)" if scan_ports_flag else ""
+                print(f"[{progress:.1f}%] Found device: {result['ip']}{ports_info} (Elapsed: {format_time(elapsed)})")
+            else:
+                print(f"[{progress:.1f}%] Scanned: {completed}/{total_hosts} hosts (Elapsed: {format_time(elapsed)})",
+                      end='\r')
+
+    total_time = time.time() - start_time
+    print(f"\n\nScan completed in: {format_time(total_time)}")
+
+    return devices, total_time
+
+
+def format_time(seconds):
+    """Format time in seconds to human-readable format."""
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = seconds % 60
+        return f"{minutes}m {secs:.0f}s"
+    else:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = seconds % 60
+        return f"{hours}h {minutes}m {secs:.0f}s"
+
+
+def display_results(devices, show_ports=False, scan_time=None):
+    """Display scan results in a formatted table."""
+    if not devices:
+        print("\nNo devices found on the network.")
+        if scan_time:
+            print(f"Total scan time: {format_time(scan_time)}")
+        return
+
+    print(f"\n{'=' * 100}")
+    print(f"SCAN SUMMARY")
+    print(f"{'=' * 100}")
+    print(f"Found {len(devices)} device(s) on the network")
+    if scan_time:
+        print(f"Total scan time: {format_time(scan_time)}")
+        print(f"Average time per device: {format_time(scan_time / len(devices))}")
+    print(f"{'=' * 100}")
+
+    if not show_ports:
+        print(f"{'IP Address':<18} {'MAC Address':<20} {'Hostname':<30} {'Status'}")
+        print(f"{'-' * 100}")
+
+        for device in sorted(devices, key=lambda x: tuple(map(int, x['ip'].split('.')))):
+            print(f"{device['ip']:<18} {device['mac']:<20} {device['hostname']:<30} {device['status']}")
+    else:
+        for device in sorted(devices, key=lambda x: tuple(map(int, x['ip'].split('.')))):
+            print(f"\n{'─' * 100}")
+            print(f"IP Address:  {device['ip']}")
+            print(f"MAC Address: {device['mac']}")
+            print(f"Hostname:    {device['hostname']}")
+            print(f"Status:      {device['status']}")
+
+            if device['open_ports']:
+                # Separate TCP and UDP ports
+                tcp_ports = [p for p in device['open_ports'] if p['protocol'] == 'TCP']
+                udp_ports = [p for p in device['open_ports'] if p['protocol'] == 'UDP']
+
+                print(f"Open Ports:  {len(device['open_ports'])} found ({len(tcp_ports)} TCP, {len(udp_ports)} UDP)")
+
+                # Display TCP ports
+                if tcp_ports:
+                    print(f"\n             TCP Ports:")
+                    for port_info in sorted(tcp_ports, key=lambda x: x['port']):
+                        print(f"             → Port {port_info['port']} ({port_info['service']})")
+                        if port_info.get('banner'):
+                            banner_lines = port_info['banner'].split('\n')
+                            for i, line in enumerate(banner_lines[:3]):
+                                if line.strip():
+                                    prefix = "               Banner: " if i == 0 else "                       "
+                                    print(f"{prefix}{line.strip()}")
+                            if len(banner_lines) > 3:
+                                print(f"                       [... truncated]")
+
+                # Display UDP ports
+                if udp_ports:
+                    print(f"\n             UDP Ports:")
+                    for port_info in sorted(udp_ports, key=lambda x: x['port']):
+                        print(f"             → Port {port_info['port']} ({port_info['service']})")
+            else:
+                print(f"Open Ports:  None detected")
+
+    print(f"\n{'=' * 100}\n")
+
+
+def main():
+    """Main function to run the network scanner."""
+    import sys
+
+    overall_start = time.time()
+
+    print("Juggernaught - V1.1")
+    print("Network Device Scanner with Port Detection")
+    print("=" * 100)
+    print(f"Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    # Parse command line arguments
+    scan_ports_flag = '-p' in sys.argv or '--ports' in sys.argv
+    full_scan = '-f' in sys.argv or '--full' in sys.argv
+    scan_udp = '-u' in sys.argv or '--udp' in sys.argv
+
+    scan_type = 'full' if full_scan else 'common'
+
+    # Get local IP and calculate network range
+    local_ip = get_local_ip()
+    print(f"Local IP: {local_ip}")
+
+    network_range = get_network_range(local_ip)
+
+    # Allow user to specify custom range
+    custom_range = input(f"Enter network range (default: {network_range}): ").strip()
+    if custom_range:
+        network_range = custom_range
+
+    # Ask about port scanning if not specified via command line
+    if not scan_ports_flag and '-np' not in sys.argv and '--no-ports' not in sys.argv:
+        port_choice = input("Scan for open ports on devices? (y/n, default: n): ").strip().lower()
+        scan_ports_flag = port_choice == 'y'
+
+        if scan_ports_flag:
+            full_choice = input("Perform full port scan (1-65535)? (y/n, default: n): ").strip().lower()
+            scan_type = 'full' if full_choice == 'y' else 'common'
+
+            udp_choice = input("Include UDP port scanning? (y/n, default: n): ").strip().lower()
+            scan_udp = udp_choice == 'y'
+
+    print()
+
+    # Scan the network
+    devices, scan_time = scan_network(network_range, scan_ports_flag, scan_type, scan_udp)
+
+    # Display results
+    display_results(devices, scan_ports_flag, scan_time)
+
+    overall_time = time.time() - overall_start
+    print(f"Program finished at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Total execution time: {format_time(overall_time)}\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nScan interrupted by user.")
+    except Exception as e:
+        print(f"\nError: {e}")
